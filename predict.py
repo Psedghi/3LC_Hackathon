@@ -1,217 +1,147 @@
 """
-Predict on test images and create submission.csv for Kaggle.
-
-- Loads best_model.pth (saved by train.py). Exits with a clear message if missing.
-- Runs inference on data/test/ (flat folder; no labels).
-- Writes submission.csv with columns image_id, prediction, confidence.
-  If sample_submission.csv exists, output is aligned to its image_ids (same order;
-  missing test images get prediction 0, confidence 0.5 so the file is valid).
-- submission.csv is overwritten each run.
-
-Usage:
-    python predict.py
-
-Outputs:
-    submission.csv  - Kaggle submission (overwritten each run).
+Generate predictions on the hidden test set for the Chihuahua vs Muffin hackathon.
+Matches the upgraded ResNet-18 architecture used in the optimized train.py.
 """
 
+import os
+import csv
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision.models as models
 import torchvision.transforms as transforms
-from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from pathlib import Path
 from tqdm import tqdm
-import csv
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-
-MODEL_PATH = Path("best_model.pth")
-TEST_DIR = Path("data/test")
-OUTPUT_PATH = Path("submission.csv")
-SAMPLE_SUBMISSION_PATH = Path("sample_submission.csv")
+MODEL_PATH = "best_model.pth"
+TEST_DIR = "data/test"
+OUTPUT_CSV = "submission.csv"
 NUM_CLASSES = 2
-CLASS_NAMES = ["chihuahua", "muffin"]
-BATCH_SIZE = 32  # Reduce if your system runs out of memory
-IMAGE_SIZE = 128
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
-
+# Hardware Optimization
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+elif torch.backends.mps.is_available():
+    device = torch.device("mps")
+else:
+    device = torch.device("cpu")
 
 # ============================================================================
-# MODEL (must match train.py)
+# MODEL (Must exactly match the upgraded train.py)
 # ============================================================================
-
 class ResNet18Classifier(nn.Module):
     def __init__(self, num_classes=2):
         super(ResNet18Classifier, self).__init__()
         self.resnet = models.resnet18(weights=None)
         resnet_features = self.resnet.fc.in_features
         self.resnet.fc = nn.Identity()
+        
         self.classifier = nn.Sequential(
             nn.Linear(resnet_features, 256),
+            nn.BatchNorm1d(256), 
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(0.4),     
             nn.Linear(256, 128),
+            nn.BatchNorm1d(128), 
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(0.4),     
             nn.Linear(128, num_classes),
         )
 
     def forward(self, x):
-        return self.classifier(self.resnet(x))
-
-
-# ============================================================================
-# DATASET
-# ============================================================================
-
-class TestDataset(Dataset):
-    """Flat test folder: all images, no labels. Returns (image, image_id)."""
-    def __init__(self, image_dir: Path, transform=None):
-        self.image_dir = Path(image_dir)
-        self.transform = transform
-        self.images = []
-        if self.image_dir.exists():
-            seen = set()
-            for ext in ["*.jpg", "*.jpeg", "*.png"]:
-                for img in self.image_dir.glob(ext):
-                    key = img.name.lower()
-                    if key not in seen:
-                        seen.add(key)
-                        self.images.append(img)
-        self.images.sort(key=lambda x: x.name)
-        print(f"  Found {len(self.images)} images in {image_dir}")
-
-    def __len__(self):
-        return len(self.images)
-
-    def __getitem__(self, idx):
-        img_path = self.images[idx]
-        try:
-            image = Image.open(img_path).convert("RGB")
-        except Exception as e:
-            print(f"Warning: Could not load {img_path}: {e}")
-            image = Image.new("RGB", (IMAGE_SIZE, IMAGE_SIZE), (128, 128, 128))
-        if self.transform:
-            image = self.transform(image)
-        # Use stem (no extension) as image_id to match typical Kaggle format
-        image_id = img_path.stem
-        return image, image_id
-
+        features = self.resnet(x)
+        return self.classifier(features)
 
 # ============================================================================
 # TRANSFORMS
 # ============================================================================
-
-test_transform = transforms.Compose([
-    transforms.Resize(IMAGE_SIZE),
-    transforms.CenterCrop(IMAGE_SIZE),
+# Must match the val_transform from train.py
+val_transform = transforms.Compose([
+    transforms.Resize(128),
+    transforms.CenterCrop(128),
     transforms.ToTensor(),
     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
 ])
 
-
-def predict_on_dataset(model, dataloader, device):
-    predictions = []
-    model.eval()
-    with torch.no_grad():
-        for images, filenames in tqdm(dataloader, desc="Predicting"):
-            images = images.to(device)
-            outputs = model(images)
-            probs = torch.nn.functional.softmax(outputs, dim=1)
-            confidences, predicted = probs.max(1)
-            for fid, pred, conf in zip(filenames, predicted.cpu().numpy(), confidences.cpu().numpy()):
-                predictions.append({
-                    "image_id": fid,
-                    "prediction": int(pred),
-                    "confidence": float(conf),
-                })
-    return predictions
-
-
-def load_expected_image_ids():
-    """Load image_id order from sample_submission.csv if present; else None."""
-    if not SAMPLE_SUBMISSION_PATH.exists():
-        return None
-    with open(SAMPLE_SUBMISSION_PATH, "r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        if "image_id" not in (reader.fieldnames or []):
-            return None
-        return [row["image_id"] for row in reader]
-
-
-def main():
+# ============================================================================
+# PREDICTION LOOP
+# ============================================================================
+def predict():
     print("=" * 60)
-    print("  Chihuahua vs Muffin - Prediction")
+    print("  Chihuahua vs Muffin - Prediction (Upgraded Model)")
     print("=" * 60)
+    print(f"Using device: {device}")
 
-    if not MODEL_PATH.exists():
-        print(f"[ERROR] Model not found: {MODEL_PATH}")
-        print("  Run train.py first to train and save best_model.pth.")
-        return 1
-
+    # 1. Load Model
     print("\n[1/4] Loading model...")
-    try:
-        state = torch.load(MODEL_PATH, map_location=device)
-    except Exception as e:
-        print(f"[ERROR] Could not load model file: {e}")
-        return 1
-    model = ResNet18Classifier(num_classes=NUM_CLASSES)
-    try:
-        model.load_state_dict(state)
-    except Exception as e:
-        print(f"[ERROR] Model state_dict invalid or incompatible: {e}")
-        return 1
-    model = model.to(device)
+    model = ResNet18Classifier(num_classes=NUM_CLASSES).to(device)
+    
+    if not os.path.exists(MODEL_PATH):
+        print(f"[ERROR] Model file not found at {MODEL_PATH}")
+        return
+        
+    model.load_state_dict(torch.load(MODEL_PATH, map_location=device, weights_only=True))
     model.eval()
-    print(f"  [OK] Loaded {MODEL_PATH}")
+    print("  [OK] Model loaded successfully.")
 
-    print("\n[2/4] Predicting on test images...")
-    if not TEST_DIR.exists():
-        print(f"  [ERROR] Test directory not found: {TEST_DIR}")
-        return 1
-    test_dataset = TestDataset(TEST_DIR, transform=test_transform)
-    if len(test_dataset) == 0:
-        print(f"  [ERROR] No images in {TEST_DIR}. Add test images (flat folder).")
-        return 1
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
-    predictions = predict_on_dataset(model, test_loader, device)
-    pred_by_id = {p["image_id"]: p for p in predictions}
-    print(f"  [OK] Predicted {len(predictions)} images")
+    # 2. Check Test Directory
+    print(f"\n[2/4] Reading test images from {TEST_DIR}...")
+    if not os.path.exists(TEST_DIR):
+        print(f"[ERROR] Test directory not found at {TEST_DIR}")
+        return
+        
+    image_files = sorted([f for f in os.listdir(TEST_DIR) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
+    if not image_files:
+        print(f"[ERROR] No images found in {TEST_DIR}")
+        return
+    print(f"  [OK] Found {len(image_files)} test images.")
 
-    print("\n[3/4] Aligning to submission format...")
-    expected_ids = load_expected_image_ids()
-    if expected_ids is not None:
-        # Ensure submission has same rows and order as sample_submission.csv
-        rows = []
-        for image_id in expected_ids:
-            if image_id in pred_by_id:
-                rows.append(pred_by_id[image_id])
-            else:
-                rows.append({"image_id": image_id, "prediction": 0, "confidence": 0.5})
-        predictions = rows
-        print(f"  [OK] Aligned to {SAMPLE_SUBMISSION_PATH} ({len(predictions)} rows)")
-    else:
-        print(f"  [INFO] No {SAMPLE_SUBMISSION_PATH}; output order = test folder order")
+    # 3. Run Inference
+    print("\n[3/4] Running inference...")
+    results = []
+    
+    with torch.no_grad():
+        for filename in tqdm(image_files, desc="Predicting"):
+            img_path = os.path.join(TEST_DIR, filename)
+            try:
+                image = Image.open(img_path)
+                if image.mode != "RGB":
+                    image = image.convert("RGB")
+                    
+                input_tensor = val_transform(image).unsqueeze(0).to(device)
+                outputs = model(input_tensor)
+                
+                # Calculate prediction and confidence
+                softmax_outputs = F.softmax(outputs, dim=1)
+                confidence, predicted_class = torch.max(softmax_outputs, 1)
+                
+                image_id = os.path.splitext(filename)[0]
+                results.append({
+                    "image_id": image_id,
+                    "prediction": predicted_class.item(),
+                    "confidence": f"{confidence.item():.4f}"
+                })
+            except Exception as e:
+                print(f"\n[WARNING] Failed to process {filename}: {e}")
 
-    print("\n[4/4] Writing submission.csv...")
-    with open(OUTPUT_PATH, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["image_id", "prediction", "confidence"])
-        writer.writeheader()
-        writer.writerows(predictions)
-    print(f"  [OK] Written to {OUTPUT_PATH} (overwrites previous file)")
+    # 4. Write CSV
+    print(f"\n[4/4] Writing predictions to {OUTPUT_CSV}...")
+    try:
+        with open(OUTPUT_CSV, mode='w', newline='') as csv_file:
+            fieldnames = ["image_id", "prediction", "confidence"]
+            writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in results:
+                writer.writerow(row)
+        print(f"  [OK] Submission saved to {OUTPUT_CSV}")
+    except Exception as e:
+        print(f"[ERROR] Failed to write CSV: {e}")
 
-    print("\n" + "=" * 60)
-    print("  Submission ready for Kaggle upload")
-    print("  Columns: image_id, prediction (0=chihuahua, 1=muffin), confidence")
-    print("=" * 60)
-    return 0
-
+    print("\n[DONE] You can now upload submission.csv to Kaggle!")
 
 if __name__ == "__main__":
-    exit(main())
+    predict()

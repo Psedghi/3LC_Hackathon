@@ -1,19 +1,6 @@
 """
 Train ResNet-18 classifier on Chihuahua vs Muffin dataset using 3LC.
-
-- 3LC Table loading (train + val). By default uses .latest() so Dashboard
-  edits are picked up automatically. Optional: load by explicit table URLs
-  (see OPTION 2 in code, commented out).
-- ResNet-18 training with weighted sampling (exclude undefined).
-- Per-sample metrics and embeddings collection.
-- Best model saved to best_model.pth (overwritten each run).
-
-Usage:
-    python register_tables.py  # Run once
-    python train.py
-
-Outputs:
-    best_model.pth  - Best checkpoint by validation accuracy (overwritten each run).
+Optimized for high-accuracy hackathon performance.
 """
 
 import torch
@@ -35,16 +22,23 @@ import os
 # CONFIGURATION
 # ============================================================================
 
-EPOCHS = 10
+EPOCHS = 80  # Increased to allow the model to learn edge cases
 BATCH_SIZE = 16
-LEARNING_RATE = 0.0001
+LEARNING_RATE = 0.0003  # Slightly higher initial LR for Cosine Annealing
 RANDOM_SEED = 42
 PROJECT_NAME = "Chihuahua-Muffin"
 DATASET_NAME = "chihuahua-muffin"
-NUM_CLASSES = 2  # chihuahua, muffin (undefined excluded from training)
+NUM_CLASSES = 2  
 CLASS_NAMES = ["chihuahua", "muffin", "undefined"]
-# Competition rule: train from scratch. No pretrained weights allowed.
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Hardware Optimization: Added Apple Silicon (MPS) support
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+elif torch.backends.mps.is_available():
+    device = torch.device("mps")
+else:
+    device = torch.device("cpu")
+
 print(f"Using device: {device}")
 print(f"ResNet-18: random init (no pretrained weights — competition rules)")
 
@@ -54,7 +48,8 @@ def set_seed(seed):
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
         os.environ["PYTHONHASHSEED"] = str(seed)
@@ -66,20 +61,24 @@ def set_seed(seed):
 # ============================================================================
 
 class ResNet18Classifier(nn.Module):
-    """ResNet-18 for Chihuahua vs Muffin (fixed architecture). Train from scratch — no pretrained weights (competition rule)."""
+    """ResNet-18 for Chihuahua vs Muffin (fixed architecture). Train from scratch."""
     def __init__(self, num_classes=2):
         super(ResNet18Classifier, self).__init__()
         # No pretrained weights: competition requires training from scratch.
         self.resnet = models.resnet18(weights=None)
         resnet_features = self.resnet.fc.in_features
         self.resnet.fc = nn.Identity()
+        
+        # Added slight regularization to prevent overfitting on the small dataset
         self.classifier = nn.Sequential(
             nn.Linear(resnet_features, 256),
+            nn.BatchNorm1d(256), # Added Batch Normalization
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(0.4),     # Increased Dropout
             nn.Linear(256, 128),
+            nn.BatchNorm1d(128), # Added Batch Normalization
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(0.4),     # Increased Dropout
             nn.Linear(128, num_classes),
         )
 
@@ -89,17 +88,21 @@ class ResNet18Classifier(nn.Module):
 
 
 # ============================================================================
-# TRANSFORMS
+# TRANSFORMS (Heavy Augmentation)
 # ============================================================================
 
 train_transform = transforms.Compose([
     transforms.Resize(128),
-    transforms.RandomCrop(128),
+    transforms.RandomCrop(128, padding=4, padding_mode='reflect'),
     transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(15), 
+    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
     transforms.RandomAffine(0, shear=10, scale=(0.8, 1.2)),
     transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    # Standard ImageNet normalization helps even when training from scratch
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]), 
 ])
+
 val_transform = transforms.Compose([
     transforms.Resize(128),
     transforms.CenterCrop(128),
@@ -107,13 +110,11 @@ val_transform = transforms.Compose([
     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
 ])
 
-
 def train_fn(sample):
     image = Image.open(sample["image"])
     if image.mode != "RGB":
         image = image.convert("RGB")
     return train_transform(image), sample["label"]
-
 
 def val_fn(sample):
     image = Image.open(sample["image"])
@@ -150,9 +151,7 @@ def metrics_fn(batch, predictor_output: tlc.PredictorOutput):
 # TRAINING
 # ============================================================================
 
-# Default: output path for best model (overwritten each run)
 BEST_MODEL_FILENAME = "best_model.pth"
-
 
 def train():
     set_seed(RANDOM_SEED)
@@ -164,17 +163,7 @@ def train():
     )
     print(f"[OK] Registered data path: {base_path.absolute()}")
 
-    # -------------------------------------------------------------------------
-    # Load 3LC Tables
-    # -------------------------------------------------------------------------
-    # OPTION 1 (default): Load by name with .latest() — uses newest revision
-    # and picks up any edits made in the 3LC Dashboard.
-    # OPTION 2 (commented out): Load by URL for a specific table revision.
-    # Get URLs from Dashboard: Tables tab → select table → copy URL.
-    # -------------------------------------------------------------------------
     print("\nLoading 3LC tables...")
-
-    # OPTION 1: Load by name (recommended — automatic latest revision)
     train_table = tlc.Table.from_names(
         project_name=PROJECT_NAME,
         dataset_name=DATASET_NAME,
@@ -186,21 +175,13 @@ def train():
         table_name="val",
     ).latest()
 
-    # OPTION 2: Load by URL (uncomment and set URLs to use a specific revision)
-    # TRAIN_TABLE_URL = "paste_your_train_table_url_here"
-    # VAL_TABLE_URL = "paste_your_val_table_url_here"
-    # train_table = tlc.Table.from_url(TRAIN_TABLE_URL)
-    # val_table = tlc.Table.from_url(VAL_TABLE_URL)
-
     print(f"  Train: {len(train_table)} samples")
     print(f"  Val:   {len(val_table)} samples")
-    print(f"  Train table URL: {train_table.url}")
-    print(f"  Val table URL:   {val_table.url}")
     class_names = list(train_table.get_simple_value_map("label").values())
-    print(f"  Classes: {class_names}")
 
     train_table.map(train_fn).map_collect_metrics(val_fn)
     val_table.map(val_fn)
+    
     train_sampler = train_table.create_sampler(exclude_zero_weights=True)
     train_dataloader = DataLoader(
         train_table,
@@ -211,9 +192,11 @@ def train():
     val_dataloader = DataLoader(val_table, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
     model = ResNet18Classifier(num_classes=NUM_CLASSES).to(device)
+    
+    # Advanced Optimization Setup
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-3)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
 
     run = tlc.init(
         project_name=PROJECT_NAME,
@@ -244,7 +227,8 @@ def train():
         model.train()
         for images, labels in tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{EPOCHS}"):
             images, labels = images.to(device), labels.to(device)
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True) # Performance optimization
+            
             outputs = model(images)
             loss = criterion(outputs, labels)
             loss.backward()
@@ -258,14 +242,19 @@ def train():
                 pred = model(images).argmax(1)
                 val_correct += (pred == labels).sum().item()
                 val_total += labels.size(0)
+                
         val_accuracy = 100 * val_correct / val_total
         scheduler.step()
-        print(f"Epoch {epoch+1}/{EPOCHS} - Val Acc: {val_accuracy:.2f}%")
+        
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"Epoch {epoch+1}/{EPOCHS} - Val Acc: {val_accuracy:.2f}% | LR: {current_lr:.6f}")
+        
         if val_accuracy > best_val_accuracy:
             best_val_accuracy = val_accuracy
             best_model_state = model.state_dict().copy()
             print(f"  --> New best model!")
-        tlc.log({"epoch": epoch, "val_accuracy": val_accuracy})
+            
+        tlc.log({"epoch": epoch, "val_accuracy": val_accuracy, "learning_rate": current_lr})
 
     print("\n" + "=" * 60)
     print(f"  Best validation accuracy: {best_val_accuracy:.2f}%")
@@ -288,7 +277,6 @@ def train():
     )
     print("\nReducing embeddings...")
     try:
-        # Use UMAP (default); PaCMAP can fail with "_var_var_13" on some setups (e.g. PyTorch nightly / RTX 50).
         run.reduce_embeddings_by_foreign_table_url(
             train_table.url,
             method="umap",
@@ -298,10 +286,8 @@ def train():
         print("  [OK] Embeddings reduced (UMAP, 3D).")
     except Exception as e:
         print(f"  WARNING: Embedding reduction failed: {e}")
-        print("  Training and metrics are saved. Run and table are still valid; only the embedding view may be missing in the Dashboard.")
     run.set_status_completed()
     print("\n[OK] Done. View results at 3LC Dashboard (run: 3lc service)")
-
 
 if __name__ == "__main__":
     train()
