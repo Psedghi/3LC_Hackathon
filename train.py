@@ -22,7 +22,7 @@ import os
 # CONFIGURATION
 # ============================================================================
 
-EPOCHS = 80  # Increased to allow the model to learn edge cases
+EPOCHS = 150  # Increased to allow the model to learn edge cases
 BATCH_SIZE = 16
 LEARNING_RATE = 0.0003  # Slightly higher initial LR for Cosine Annealing
 RANDOM_SEED = 42
